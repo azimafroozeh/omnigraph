@@ -110,17 +110,19 @@ pub fn hydrate_chunk_bytes(pool: u64) -> u64 {
 }
 
 /// The access path of a dependent scan. `HashJoin` needs both: the table
-/// holds at most `HASH_JOIN_RATIO` rows per frontier row, and the build
-/// side's estimated bytes are known and at most `build_bytes_budget`.
-/// `None` when either row count is unknown (the model did not decide).
+/// holds at most `HASH_JOIN_RATIO` rows per input row (the traversal's output
+/// estimate, not the Expand's `frontier_estimate`, which is its input), and
+/// the build side's estimated bytes are known and at most
+/// `build_bytes_budget`. `None` when either row count is unknown (the model
+/// did not decide).
 pub fn choose_access_path(
-    frontier_rows: Option<u64>,
+    input_rows: Option<u64>,
     table_rows: Option<u64>,
     build_bytes: Option<u64>,
     build_bytes_budget: u64,
 ) -> Option<AccessPath> {
-    let (frontier, rows) = (frontier_rows?, table_rows?);
-    let few_rows = rows <= frontier.saturating_mul(HASH_JOIN_RATIO);
+    let (input, rows) = (input_rows?, table_rows?);
+    let few_rows = rows <= input.saturating_mul(HASH_JOIN_RATIO);
     let fits = build_bytes.is_some_and(|bytes| bytes <= build_bytes_budget);
     Some(if few_rows && fits {
         AccessPath::HashJoin
@@ -312,12 +314,24 @@ pub fn direction_probe_factor(direction: Direction) -> f64 {
     }
 }
 
+/// One equality on a property whose distinct count the source does not hold
+/// keeps one row in this many: Kùzu's fallback for the same case (PostgreSQL
+/// keeps one in 200, Selinger one in 10). Two such equalities on a table of
+/// 10,000 rows estimate one row.
+pub const EQUALITY_SELECTIVITY_DIVISOR: u64 = 100;
+
 /// The rows one query scan reads: the node type's row count, or at most one
 /// row per value when the pushed filter holds every `@key` column, or one
 /// unique property, of the scan's binding to a bounded number of values: one
 /// for `=` with a literal or a parameter, the element count for membership in
-/// a list. Any other pushed filter leaves the row count as it is. `None` when
-/// the source holds no row count for the type.
+/// a list, at least one (an empty list prices as one value, not as no row;
+/// the rows it keeps are none). A bounded property that is neither (a key column counts as neither
+/// while the filter leaves another key column free) keeps `values` rows per
+/// `distinct_count` of the property, or per `EQUALITY_SELECTIVITY_DIVISOR`
+/// when the source holds none; such bounds multiply as independent, and the
+/// estimate stays at least one row of a non-empty table. Any other pushed
+/// filter leaves the row count as it is. `None` when the source holds no row
+/// count for the type.
 pub fn scan_row_estimate(spec: &ScanSpec, source: &dyn PlanSource) -> Option<u64> {
     let node_type = source.node_type(spec.table.node_type_name()?).ok()?;
     let rows = node_type.row_count?;
@@ -349,10 +363,37 @@ pub fn scan_row_estimate(spec: &ScanSpec, source: &dyn PlanSource) -> Option<u64
         .filter(|(property, _)| source.is_unique_property(&spec.table.type_key, property))
         .map(|(_, values)| *values)
         .min();
-    Some(match whole_key.into_iter().chain(unique).min() {
-        Some(bound) => rows.min(bound),
-        None => rows,
-    })
+    let cap = whole_key
+        .into_iter()
+        .chain(unique)
+        .min()
+        .map_or(rows, |bound| rows.min(bound));
+    let keyed = |property: &str| {
+        (whole_key.is_some() && node_type.key.iter().any(|key| key == property))
+            || source.is_unique_property(&spec.table.type_key, property)
+    };
+    let mut plain: Vec<(&str, u64)> = Vec::new();
+    for (property, values) in &bounded {
+        if keyed(property) {
+            continue;
+        }
+        match plain.iter_mut().find(|(name, _)| name == property) {
+            Some((_, kept)) => *kept = (*kept).min(*values),
+            None => plain.push((property, *values)),
+        }
+    }
+    let selectivity = plain.iter().fold(1.0_f64, |product, (property, values)| {
+        let distinct = source
+            .distinct_count(&spec.table.type_key, property)
+            .unwrap_or(EQUALITY_SELECTIVITY_DIVISOR)
+            .max(1);
+        product * (*values as f64 / distinct as f64).min(1.0)
+    });
+    if cap == 0 || plain.is_empty() {
+        return Some(cap);
+    }
+    let scaled = (cap as f64 * selectivity).ceil() as u64;
+    Some(scaled.clamp(1, cap))
 }
 
 /// The property of `binding` a conjunct holds to a bounded number of values,
@@ -401,10 +442,28 @@ fn bounded_property<'a>(
 /// The cardinality estimate of one logical node from the node types' row
 /// counts and the edge statistics the source holds: an `Expand` multiplies
 /// its input by the edge type's average fanout per hop and saturates at the
-/// destination type's row count, so a hub can exceed it. `None` where the
-/// source holds no statistic for a node the estimate depends on.
+/// larger of the edge count and the destination type's row count (distinct
+/// inputs emit at most one row per edge; a many-to-one hop keeps its input's
+/// rows, which are not distinct destinations), so a hub can exceed it, and at
+/// its input's rows times the destination count (one input reaches at most
+/// every destination, however many hops it takes); a
+/// dependent scan keeps its input's rows scaled by its own bound
+/// (`dependent_scan_rows`). `None` where the source holds no statistic for a
+/// node the estimate depends on.
 pub fn estimate_rows(plan: &LogicalPlan, node: LogicalId, source: &dyn PlanSource) -> Option<u64> {
     estimate_rows_over(plan, node, source, None)
+}
+
+/// The rows a dependent scan keeps of `input_rows`: each input row keeps its
+/// destination row when the scan's own bound (`bound` rows of `table_rows`)
+/// admits it, so the input scaled by that fraction, at least one row of a
+/// non-empty input and never more than the input.
+pub fn dependent_scan_rows(input_rows: u64, bound: u64, table_rows: u64) -> u64 {
+    if input_rows == 0 || table_rows == 0 {
+        return 0;
+    }
+    let kept = (input_rows as f64 * bound as f64 / table_rows as f64).ceil() as u64;
+    kept.clamp(1, input_rows)
 }
 
 /// The rows a correlated block's single-input chain produces, summed from
@@ -443,10 +502,17 @@ fn estimate_rows_over(
     };
     match plan.node(node)? {
         LogicalNode::TableScan { input, spec } => {
-            let rows = scan_row_estimate(spec, source)?;
+            let bound = scan_row_estimate(spec, source)?;
             match input {
-                Some(input) => Some(estimate_rows(plan, *input, source)?.min(rows)),
-                None => Some(rows),
+                Some(input) => {
+                    let input_rows = estimate_rows(plan, *input, source)?;
+                    let table_rows = source
+                        .node_type(spec.table.node_type_name()?)
+                        .ok()?
+                        .row_count?;
+                    Some(dependent_scan_rows(input_rows, bound, table_rows))
+                }
+                None => Some(bound),
             }
         }
         LogicalNode::MetadataCount { .. } => Some(1),
@@ -465,9 +531,13 @@ fn estimate_rows_over(
                 .div_ceil(stats.src_node_count.max(1))
                 .max(1);
             let hops = executed_hops(*min_hops, *max_hops);
+            let ceiling = stats
+                .dst_node_count
+                .max(stats.edge_count)
+                .min(input_rows.saturating_mul(stats.dst_node_count));
             let mut rows = input_rows;
             for _ in 0..hops.max(1) {
-                let next = rows.saturating_mul(fanout).min(stats.dst_node_count);
+                let next = rows.saturating_mul(fanout).min(ceiling);
                 if next == rows {
                     break;
                 }
@@ -802,12 +872,12 @@ mod tests {
         );
     }
 
-    /// `rows <= frontier * HASH_JOIN_RATIO` reads the table once: 20,000
-    /// rows under a 20,000 frontier and 6 under 6 join; 20 rows under a
-    /// frontier of 1 (8 < 20) look ids up; an unknown count decides nothing.
+    /// `rows <= input * HASH_JOIN_RATIO` reads the table once: 20,000 rows
+    /// under a 20,000-row input and 6 under 6 join; 20 rows under an input of
+    /// 1 (8 < 20) look ids up; an unknown count decides nothing.
     #[test]
-    fn access_path_joins_when_the_table_is_at_most_eight_frontiers() {
-        let path = |frontier, rows| choose_access_path(frontier, rows, Some(0), 0);
+    fn access_path_joins_when_the_table_is_at_most_eight_inputs() {
+        let path = |input, rows| choose_access_path(input, rows, Some(0), 0);
         assert_eq!(path(Some(20_000), Some(20_000)), Some(AccessPath::HashJoin));
         assert_eq!(path(Some(6), Some(6)), Some(AccessPath::HashJoin));
         assert_eq!(path(Some(1), Some(8)), Some(AccessPath::HashJoin));

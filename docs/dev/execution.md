@@ -157,9 +157,14 @@ the in-memory CSR, `csr`) is a plan decision. The planner's
 cost model (`omnigraph_planner::cost`: `choose_expand_mode`,
 `CSR_BUILD_FACTOR`) decides at plan time from the row-count estimate of the
 Expand's input (`estimate_rows`: the node type's `entity_count`, reduced
-to one for equality on an `@key` property, then multiplied per hop by the
-edge type's average fanout and capped at its destination count; this is an
-estimate, not an upper bound),
+to one for equality on an `@key` or unique property and to one part in
+`EQUALITY_SELECTIVITY_DIVISOR` (100) per equality on any other property, or
+one part in the property's distinct count when the source holds one, then
+multiplied per hop by the edge type's average fanout and capped at the
+larger of its edge count and its destination count and at the input's rows
+times that destination count, a dependent scan
+keeping its input's rows scaled by its own bound; this is an estimate, not
+an upper bound),
 the manifest-resident edge and endpoint node counts the engine serves through
 `PlanSource::expand_statistics`, pinned endpoint index coverage, the effective hop count and whether an
 earlier `Expand` or `AntiJoin` of the same plan realized the CSR. The
@@ -216,8 +221,8 @@ outer rows times the correlation binding's fanout, and every destination it
 reaches is looked up once per slice of those rows. When the block's pattern
 touches the outer rows only through the correlation binding's identity, the
 planner also builds a `key_set` tree (`omnigraph_planner` `key_set.rs`): the
-same pattern rooted at the block's most bounded binding (a key or unique
-equality or a list membership on its own scan, below the table's row count),
+same pattern rooted at the block's most bounded binding (a key, unique or
+plain equality or a list membership on its own scan, below the table's row count),
 each `Expand` written toward that root reversed, ending on the correlation
 binding's identity column with no scan of it. An unbound `Expand` emits one row
 per distinct endpoint pair and a bound one one row per edge row, in either
@@ -348,9 +353,10 @@ has no `Aggregate`, and the binding's scan is unique and unranked, or is one
 of the two ranked arm scans of a `RankFuse`, which the pass rewrites together
 so the arms carry ids, scores and the row address into the fusion (a lone
 ranked scan keeps its columns); a binding
-whose scan row estimate (the manifest row count, one row
-under a key equality) is at most `HYDRATE_ROW_RATIO` (4) times `K` keeps its
-columns. A scan below a limit reads more rows than the limit keeps whenever a
+whose scan row estimate (`scan_row_estimate`: the manifest row count, one
+row per bound value of a key or unique property, one in 100 per bound value
+of any other) is at most
+`HYDRATE_ROW_RATIO` (4) times `K` keeps its columns. A scan below a limit reads more rows than the limit keeps whenever a
 sort, a filter or a traversal sits between them, and even a bare scan reads
 ahead of a consumer that stops early: Lance schedules I/O up to the scan's
 I/O buffer before the first batch is consumed. The logical plan keeps the full projection; the physical scan's is
@@ -411,7 +417,8 @@ so nothing materializes the traversal and the output order is the probe
 order; its output has the schema the dependent scan declares (the probe's
 columns without the destination id, then the destination's). The rule:
 `hash_join` when the table's row count is at most `HASH_JOIN_RATIO` (8) times
-the input's row-count estimate and its estimated projected bytes fit one
+the input's row-count estimate (the traversal's output, not the Expand's
+`frontier_estimate`, which is its input) and its estimated projected bytes fit one
 quarter of the query pool. Unknown row or byte estimates select `id_lookup`.
 The byte allowance leaves room for the build-side copy and hash table; it is
 an admission estimate, not a bound on all allocations inside the join. For

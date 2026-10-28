@@ -2588,7 +2588,7 @@ fn materialize_returns_late(
                 "{} rows, limit {limit}, ratio {HYDRATE_ROW_RATIO}",
                 rows.map_or_else(|| "unknown".to_string(), |rows| rows.to_string())
             ),
-            origin: "manifest row count, at most one row under a key equality".to_string(),
+            origin: "manifest row count, at most one row per bound value of a key or unique property, one in the distinct count or 100 per bound value of any other".to_string(),
         });
         if rows.is_some_and(|rows| rows <= threshold) {
             continue;
@@ -3966,7 +3966,7 @@ impl Lowering<'_> {
     /// input's row-count estimate, the destination table's row count and its
     /// build-side bytes against the pool; `IdLookup` when a count is unknown.
     fn access_path(&mut self, input: LogicalId, spec: &ScanSpec) -> Result<AccessPath, PlanError> {
-        let frontier = estimate_rows(self.logical, input, self.source);
+        let input_rows = estimate_rows(self.logical, input, self.source);
         let node_type = node_type_of(spec, self.source)?;
         let rows = node_type.row_count;
         let build_bytes = rows.and_then(|rows| {
@@ -3979,7 +3979,7 @@ impl Lowering<'_> {
             )
         });
         let budget = self.source.query_memory_pool_bytes() / HASH_JOIN_POOL_DIVISOR;
-        let Some(access) = choose_access_path(frontier, rows, build_bytes, budget) else {
+        let Some(access) = choose_access_path(input_rows, rows, build_bytes, budget) else {
             return Ok(AccessPath::IdLookup);
         };
         self.access_path = true;
@@ -4156,7 +4156,7 @@ pub fn column_statistics_needed(
         else {
             continue;
         };
-        let frontier = estimate_rows(&logical, *input, source);
+        let input_rows = estimate_rows(&logical, *input, source);
         let node_type = node_type_of(spec, source)?;
         let Some(rows) = node_type.row_count else {
             continue;
@@ -4169,7 +4169,7 @@ pub fn column_statistics_needed(
             |_| Some(0),
         );
         if budget == 0
-            || choose_access_path(frontier, Some(rows), minimum, budget)
+            || choose_access_path(input_rows, Some(rows), minimum, budget)
                 != Some(AccessPath::HashJoin)
         {
             continue;
@@ -4181,7 +4181,8 @@ pub fn column_statistics_needed(
             spec.projection.as_deref(),
             |column| source.column_data_bytes(&spec.table.type_key, column),
         );
-        if choose_access_path(frontier, Some(rows), current, budget) != Some(AccessPath::HashJoin) {
+        if choose_access_path(input_rows, Some(rows), current, budget) != Some(AccessPath::HashJoin)
+        {
             tables.insert(spec.table.type_key.clone());
         }
     }
@@ -4711,7 +4712,7 @@ fn query_scan_rows(spec: &ScanSpec, source: &dyn PlanSource) -> (Estimate, Vec<S
             Estimate::Known(rows) => rows.to_string(),
             Estimate::Unknown => "unknown".to_string(),
         },
-        origin: "manifest row count, at most one row under a key equality".to_string(),
+        origin: "manifest row count, at most one row per bound value of a key or unique property, one in the distinct count or 100 per bound value of any other".to_string(),
     }];
     (rows, sources)
 }

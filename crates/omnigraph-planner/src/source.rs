@@ -184,6 +184,13 @@ pub trait PlanSource {
         false
     }
 
+    /// The distinct values `property` takes in the table `type_key` names,
+    /// when the source holds such a statistic; `None` prices an equality on
+    /// the property at `cost::EQUALITY_SELECTIVITY_DIVISOR`.
+    fn distinct_count(&self, _type_key: &str, _property: &str) -> Option<u64> {
+        None
+    }
+
     /// The element count of the list the parameter `name` is bound to; `None`
     /// for any other value and for a source that holds no parameters.
     fn list_parameter_len(&self, _name: &str) -> Option<usize> {

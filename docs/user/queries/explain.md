@@ -64,8 +64,10 @@ traversal path the planner chose), `alternatives` (the modes the run may
 switch to: the other mode when the cost model chose and may re-decide from
 the observed frontier or a warm CSR; empty when
 the mode was pinned or chosen without statistics), `frontier_estimate`
-(the row-count estimate it chose from, `null` when the snapshot holds no
-statistics). For budgeted expansion, this is the input row-count estimate.
+(the row-count estimate of the Expand's input, the frontier its first hop
+starts from, which the mode was chosen from; `null` when the snapshot holds
+no statistics; the hop's own output estimate, which the destination's access
+path is chosen from, is not a field).
 It records `edges` as an object with `kind` (`named`, `alternation`, or `wildcard`)
 and `members`, an array of `{ "edge_type": "Knows", "direction": "out" }`
 objects. Directions are `out`, `in`, or `both`; names are canonical schema names.
@@ -103,8 +105,8 @@ cut by the `Limit` above the `Sort`) and `row_tiebreak`. A physical `AntiJoin`
 row (a correlated block: `not`, `exists`, `count` and the column aggregates)
 carries `strategy`: `correlated` when its second input starts from the outer
 rows through an `OuterReference`, `key_set` when the block's pattern runs once
-from its own most bounded binding (a key or unique equality or a list
-membership) and ends on the correlation binding, whose identity keeps or drops
+from its own most bounded binding (an equality or a list membership on one of
+its properties) and ends on the correlation binding, whose identity keeps or drops
 each outer row. The planner chooses `key_set` only for a block that reads
 nothing of the outer rows but that identity, and only when its row estimate is
 lower; it then records the pass `anti_join_strategy` and the statistic

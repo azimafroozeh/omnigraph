@@ -10,8 +10,9 @@ use omnigraph_planner::mirror::EdgeSelectionMirror;
 use omnigraph_planner::optimizer::validate_rank_fuse_row_tiebreaks;
 use omnigraph_planner::physical::Assumptions;
 
-/// A separate worker bounds synchronous planning; an async query timeout
-/// cannot interrupt accidental iteration to u32::MAX before the future yields.
+/// A separate worker bounds synchronous planning; an async query timeout cannot
+/// interrupt accidental iteration to u32::MAX before the future yields. The fixed
+/// point is min(max(destinations, edges), inputs × destinations): 3 × 16 = 48.
 #[test]
 fn issue_659_large_finite_bounds_stop_estimation_at_a_fixed_point() {
     let (completed, completion) = std::sync::mpsc::sync_channel(1);
@@ -24,6 +25,7 @@ fn issue_659_large_finite_bounds_stop_estimation_at_a_fixed_point() {
             (3, 5, u32::MAX, 3),
             (0, 10, u32::MAX, 0),
             (20, 5, u32::MAX, 16),
+            (3, 100, u32::MAX, 48),
         ] {
             let source = source_with_rows(Some(rows))
                 .with_traversal_work_limit(100)

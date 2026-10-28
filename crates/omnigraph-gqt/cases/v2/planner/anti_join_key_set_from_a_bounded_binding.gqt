@@ -1,10 +1,13 @@
 # issue: none
 # red_on: e5c14da7: `anti join $x: key_set` is no plan line; the inner tree started from every outer row.
 # notes: A correlated block that reaches the outer rows only through `$x`'s identity and binds
-# notes: one of its own nodes by a key equality runs once from that binding (`key_set`): the
-# notes: excluded source's touchpoints, then their identities. Count, sum and bound-edge blocks
-# notes: keep each outer row by its key's matches. A block whose bindings carry no bound filter,
-# notes: and a block that reads another outer binding, stay `correlated`. Rows agree either way.
+# notes: one of its own nodes by an equality runs once from that binding (`key_set`): the
+# notes: excluded source's touchpoints, then their identities. Count and sum blocks keep each
+# notes: outer row by its key's matches. A plain equality bounds a binding too (one row in 100
+# notes: of its table), so `never_forked` runs from the fork touchpoints, and the same pricing
+# notes: leaves `not_through_the_web` correlated: its outer chain estimates one starred
+# notes: touchpoint, so one probe from it (12 rows) beats the key set (13). A block that
+# notes: reads another outer binding stays `correlated`. Rows agree either way.
 
 --- runner
 timeout_ms: 10000
@@ -210,7 +213,7 @@ x.slug: String
 repos: I64
 
 --- expect plan
-anti join $x: key_set
+anti join $x: correlated
 
 --- expect same as v1
 
@@ -244,8 +247,8 @@ x.slug: String
 repos: I64
 
 --- expect plan
-anti join $x: correlated
-not pass anti_join_strategy
+anti join $x: key_set
+pass anti_join_strategy
 
 --- expect same as v1
 

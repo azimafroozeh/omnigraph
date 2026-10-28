@@ -272,7 +272,13 @@ fn a_second_expand_after_a_csr_expand_reuses_the_warm_csr() {
     let selective = source_with_rows(Some(1)).with_expand_statistics(
         "knows",
         Direction::Out,
-        knows_statistics(1),
+        ExpandStatistics {
+            edge_count: 1,
+            src_node_count: 1,
+            dst_node_count: 1,
+            max_frontier_cap: 1024,
+            max_hops_cap: 6,
+        },
     );
     let (plan, _) = physical(&op, &selective);
     assert_eq!(
@@ -519,9 +525,9 @@ fn hash_build_estimate_requires_all_projected_variable_statistics() {
     );
 }
 
-/// An equality on the whole `@key` reads at most one row, so a traversal from
-/// it costs the indexed path and the id lookup whatever the type's size; any
-/// other source filter leaves the type's row count.
+/// A whole-`@key` equality reads one row and keeps the id lookup whatever the
+/// table's size; any other equality keeps one in a hundred (50 of 5,000): the
+/// hop indexed, the 500-row frontier it reaches still an id lookup under 8.
 #[test]
 fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
     let filtered = |property: &str| {
@@ -570,9 +576,12 @@ fn a_key_equality_on_the_source_scan_bounds_the_frontier_to_one_row() {
     assert_eq!(root_rows(&plan), omnigraph_planner::Estimate::Known(1));
 
     let (plan, _) = physical(&filtered("state"), &source);
-    assert_eq!(expand_modes(&plan), vec![(ExpandMode::Csr, Some(5_000))]);
-    assert_eq!(access_paths(&plan).0, vec![AccessPath::HashJoin]);
-    assert_eq!(root_rows(&plan), omnigraph_planner::Estimate::Known(5_000));
+    assert_eq!(
+        expand_modes(&plan),
+        vec![(ExpandMode::IndexedScan, Some(50))]
+    );
+    assert_eq!(access_paths(&plan).0, vec![AccessPath::IdLookup]);
+    assert_eq!(root_rows(&plan), omnigraph_planner::Estimate::Known(50));
 
     let (plan, _) = physical(&filtered("state"), &source_with_rows(None));
     assert_eq!(root_rows(&plan), omnigraph_planner::Estimate::Unknown);
@@ -1000,10 +1009,9 @@ fn a_limit_hydrates_every_large_scan_but_not_a_key_lookup() {
     assert!(!physical_projection(&plan, "b").contains("body"));
 }
 
-/// Only a bare return-only property is hydrated: the key, a sort key, a
-/// column a filter reads, a computed return (named or not) and a return the
-/// sort orders by alias stay on the scan, and an unnamed computed return does
-/// not keep the others from hydrating.
+/// Only a bare return-only property is hydrated: the key, a sort key, a filter's
+/// column, computed returns (blocking no other) and a sort's alias stay on the
+/// scan; the `state` equality keeps 100 of 10,000 rows, above the limit's 20.
 #[test]
 fn hydration_keeps_every_column_something_besides_the_output_reads() {
     let op = Operation::Query(Box::new(QueryIR {
@@ -1065,7 +1073,7 @@ fn hydration_keeps_every_column_something_besides_the_output_reads() {
         ],
         limit: Some(5),
     }));
-    let (plan, fired) = physical(&op, &source_with_rows(Some(1_000)));
+    let (plan, fired) = physical(&op, &source_with_rows(Some(10_000)));
     assert!(fired.contains(&"late_materialization"), "{fired:?}");
     assert_eq!(
         root_hydration(&plan),
@@ -1160,10 +1168,8 @@ fn anti_join_of(plan: &PhysicalPlan) -> (omnigraph_planner::AntiJoinStrategy, Ve
 }
 
 /// A block bounded by a key equality on its own binding runs from it when its
-/// chain produces fewer rows: one `$k`, ten `$m`, a hundred `$a` keys against
-/// the correlated 1,000 outer rows expanded twice. The key-set tree is a
-/// table scan of `$k` under the pushed equality, then both hops reversed,
-/// ending on `$a` with no scan of it and no `OuterReference`.
+/// chain is cheaper (one `$k`, ten `$m`, a hundred `$a` keys against 1,000 outer
+/// rows at 10,000 per hop): `$k`'s scan, both hops reversed, no scan of `$a`.
 #[test]
 fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     use omnigraph_planner::AntiJoinStrategy;
@@ -1178,7 +1184,7 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
     assert!(
         optimized.statistics.iter().any(|statistic| {
             statistic.statistic == "anti_join_rows($a)"
-                && statistic.value == "correlated 4001 estimated, key_set 121 estimated"
+                && statistic.value == "correlated 31010 estimated, key_set 121 estimated"
         }),
         "{:?}",
         optimized.statistics
@@ -1227,7 +1233,7 @@ fn bounded_block_runs_from_its_key_set_when_its_rows_are_fewer() {
 }
 
 /// The same block over one outer row stays correlated: its 122 rows beat the
-/// 1,201 the key set reaches when each destination has a hundred sources.
+/// 10,201 the key set reaches when each destination has a hundred sources.
 #[test]
 fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
     use omnigraph_planner::AntiJoinStrategy;
@@ -1246,7 +1252,7 @@ fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
     assert!(
         optimized.statistics.iter().any(|statistic| {
             statistic.statistic == "anti_join_rows($a)"
-                && statistic.value == "correlated 122 estimated, key_set 1201 estimated"
+                && statistic.value == "correlated 122 estimated, key_set 10201 estimated"
         }),
         "{:?}",
         optimized.statistics
@@ -1260,9 +1266,9 @@ fn bounded_block_stays_correlated_when_the_outer_side_is_smaller() {
     );
 }
 
-/// No key set without a bounded binding, or when the block reads the outer
-/// rows beyond the correlation binding's identity: the planner does not
-/// price it, and the block keeps its correlated tree.
+/// No key set without a bounded binding (an equality or a list membership on
+/// its own scan; `!=` bounds nothing) or when the block reads the outer rows
+/// beyond the correlation binding's identity: the correlated tree stays.
 #[test]
 fn unbounded_or_outer_reading_blocks_stay_correlated() {
     use omnigraph_planner::AntiJoinStrategy;
@@ -1274,8 +1280,19 @@ fn unbounded_or_outer_reading_blocks_stay_correlated() {
     ));
     for (what, op) in [
         (
-            "a non-key filter bounds nothing",
-            negated_two_hops(vec![], vec![equals("k", "state", "open")], vec![]),
+            "a non-equality filter bounds nothing",
+            negated_two_hops(
+                vec![],
+                vec![IRExpr::comparison(
+                    prop("k", "state"),
+                    CompOp::Ne,
+                    IRExpr::Literal(
+                        Literal::String("open".to_string()),
+                        value_type(ScalarType::String, false),
+                    ),
+                )],
+                vec![],
+            ),
         ),
         (
             "a filter reads the outer row",
@@ -1294,6 +1311,33 @@ fn unbounded_or_outer_reading_blocks_stay_correlated() {
             "{what}"
         );
     }
+}
+
+/// A non-key equality bounds its binding to one row in a hundred, so the
+/// block runs from `$k`'s ten rows: 1,210 rows against the 31,100 of the
+/// correlated tree.
+#[test]
+fn a_non_key_equality_bounds_a_key_set_root() {
+    use omnigraph_planner::AntiJoinStrategy;
+
+    let source = anti_join_source(10);
+    let op = negated_two_hops(vec![], vec![equals("k", "state", "open")], vec![]);
+    let mut plan = resolve(&op, &source).expect("resolve");
+    let fired = rewrite(&mut plan, &source).expect("rewrite");
+    let optimized =
+        omnigraph_planner::physical_plan(&mut plan, &source, &bounds(), fired).expect("lower");
+    assert!(optimized.fired.contains(&"anti_join_strategy"));
+    assert!(
+        optimized.statistics.iter().any(|statistic| {
+            statistic.statistic == "anti_join_rows($a)"
+                && statistic.value == "correlated 31100 estimated, key_set 1210 estimated"
+        }),
+        "{:?}",
+        optimized.statistics
+    );
+    let (strategy, _) = anti_join_of(&optimized.physical);
+    assert_eq!(strategy, AntiJoinStrategy::KeySet);
+    assert_eq!(key_set_root(&optimized.physical), "k");
 }
 
 /// `$x.prop` in a list of `values`, a binding bounded to that many rows.

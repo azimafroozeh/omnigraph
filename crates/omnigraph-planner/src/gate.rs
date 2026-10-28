@@ -87,6 +87,10 @@ impl PlanSource for Recorded<'_> {
         self.source.is_unique_property(type_key, property)
     }
 
+    fn distinct_count(&self, type_key: &str, property: &str) -> Option<u64> {
+        self.source.distinct_count(type_key, property)
+    }
+
     fn list_parameter_len(&self, name: &str) -> Option<usize> {
         self.read.borrow_mut().params.insert(name.to_string());
         self.source.list_parameter_len(name)
